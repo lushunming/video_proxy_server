@@ -24,7 +24,7 @@ jobs:
 
 
           - { goos: android, goarch: arm }
-          - { goos: android, goarch: 386 }
+          - { goos: android, goarch: arm64 }
 
     steps:
       - uses: actions/checkout@v4
