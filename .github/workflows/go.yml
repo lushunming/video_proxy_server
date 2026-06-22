@@ -47,22 +47,28 @@ jobs:
 
       - name: Build Binary
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: ${{ matrix.cgo }}
+            GOOS: ${{ matrix.goos }}
+            GOARCH: ${{ matrix.goarch }}
+            CGO_ENABLED: ${{ matrix.cgo }}
         run: |
-          NAME="myapp-${{ matrix.goos }}-${{ matrix.goarch }}"
-          EXT=""
-          [ "${{ matrix.goos }}" = "windows" ] && EXT=".exe"
-          
-          # 如果是 Android 平台，配置 NDK 交叉编译器环境
-          if [ "${{ matrix.goos }}" = "android" ]; then
-            # setup-android 会自动设置 ANDROID_NDK_HOME 变量
-            export CC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.ndk_arch }}${{ matrix.api }}-clang"
-            echo "Using Android CC: $CC"
-          fi
-          
-          go build -o "${NAME}${EXT}" -ldflags="-s -w"
+            NAME="myapp-${{ matrix.goos }}-${{ matrix.goarch }}"
+            EXT=""
+            [ "${{ matrix.goos }}" = "windows" ] && EXT=".exe"
+            
+            # 如果是 Android 平台，配置 NDK 交叉编译器环境
+            if [ "${{ matrix.goos }}" = "android" ]; then
+              # 针对不同架构，现代 NDK 的 Clang 文件名拼接规则不同
+              if [ "${{ matrix.goarch }}" = "arm" ]; then
+                # 32位 arm 使用 armv7a-linux-androideabi${API}-clang
+                export CC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi${{ matrix.api }}-clang"
+              else
+                # 64位 arm64 使用 aarch64-linux-android${API}-clang
+                export CC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.ndk_arch }}${{ matrix.api }}-clang"
+              fi
+              echo "Using Android CC: $CC"
+            fi
+            
+            go build -o "${NAME}${EXT}" -ldflags="-s -w"
 
       - name: Compress Artifacts
         run: |
