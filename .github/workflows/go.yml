@@ -20,8 +20,8 @@ jobs:
           - { goos: darwin, goarch: arm64 }
           - { goos: windows, goarch: amd64 }
           - { goos: windows, goarch: arm64 }
-          - { goos: android, goarch: amd64 }
-          
+
+
           - { goos: android, goarch: arm }
           - { goos: android, goarch: 386 }
 
