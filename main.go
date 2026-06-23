@@ -2,7 +2,7 @@ package main
 
 import (
 	_ "bytes"
-	"encoding/base64"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,10 +10,10 @@ import (
 	"net"
 	"net/http"
 	"regexp"
-	"runtime"
 	"strconv"
 	_ "strings"
 	"sync"
+	"time"
 )
 
 // 全局配置
@@ -21,10 +21,14 @@ const (
 	PartSize = 1024 * 1024 // 1MB
 )
 
+// 使用 sync.Map 来安全地在并发环境下存储和检索 URL 及 Headers
+var urlMap = sync.Map{}
+var headerMap = sync.Map{}
+
 var Port = 12345
 
 // 可以根据 CPU 核心数调整
-var ThreadNum = runtime.NumCPU() * 2
+var ThreadNum = 16
 
 // findAvailablePort 从指定端口开始，找到一个可用端口
 func findAvailablePort(port int) int {
@@ -44,21 +48,49 @@ func main() {
 		fmt.Fprintf(w, "ser200")
 	})
 
+	http.HandleFunc("/buildUrl", buildUrl)
 	http.HandleFunc("/proxy", proxyHandler)
 
 	Port = findAvailablePort(Port)
 
 	log.Printf("启动服务 on %d", Port)
-	if err := http.ListenAndServe(fmt.Sprintf(":%d", Port), nil); err != nil {
+	server := &http.Server{
+		Addr:              fmt.Sprintf(":%d", Port),
+		MaxHeaderBytes:    10 * 1024 * 1024, // 10MB
+		ReadHeaderTimeout: 30 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      60 * time.Second,
+	}
+	if err := server.ListenAndServe(); err != nil {
 		log.Fatal("启动服务出错:", err)
 	}
+}
+
+type Request struct {
+	URL     string            `json:"url"`
+	Headers map[string]string `json:"headers"`
+	Key     string            `json:"key"`
+}
+
+func buildUrl(w http.ResponseWriter, r *http.Request) {
+
+	var req Request
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	urlMap.Clear()
+	headerMap.Clear()
+
+	urlMap.Store(req.Key, req.URL)
+	headerMap.Store(req.Key, req.Headers)
+
 }
 
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
 
 	// 1. 获取 Base64 编码的参数
-	urlParam := r.URL.Query().Get("url")
-	headersParam := r.URL.Query().Get("headers")
+	key := r.URL.Query().Get("key")
 	threadsParam := r.URL.Query().Get("threads")
 
 	// 设置线程数
@@ -67,43 +99,19 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("启动线程数%d", ThreadNum)
 
-	if urlParam == "" {
-		http.Error(w, "Missing 'url'  parameter", http.StatusBadRequest)
-		return
-	}
-
-	// 2. 解码 url
-	urlBytes, err := base64.StdEncoding.DecodeString(urlParam)
-	if err != nil {
-		log.Printf("URL Base64 解码错误: %v", err)
-		http.Error(w, "Invalid URL encoding", http.StatusBadRequest)
-		return
-	}
-	url := string(urlBytes)
+	url, _ := urlMap.Load(key)
 	log.Printf("URL: %s", url)
-	var headers map[string]string = map[string]string{}
-	if headersParam != "" {
 
-		// 3. 解码并解析 headers
-		headersBytes, err := base64.StdEncoding.DecodeString(headersParam)
-		if err != nil {
-			log.Printf("Headers Base64 解码错误: %v", err)
-			http.Error(w, "Invalid Headers encoding", http.StatusBadRequest)
-			return
-		}
+	headers, _ := headerMap.Load(key)
 
-		// 将 JSON 字符串解析到 map 中
-		if err := json.Unmarshal(headersBytes, &headers); err != nil {
-			log.Printf("Headers JSON 解析错误: %v", err)
-			http.Error(w, "Invalid Headers format", http.StatusBadRequest)
-			return
-		}
-	}
 	log.Printf("headers: %s", headers)
-	proxyAsync(url, headers, r, w)
+	proxyAsync(url.(string), headers.(map[string]string), r, w)
 }
 
 func proxyAsync(url string, headers map[string]string, req *http.Request, w http.ResponseWriter) {
+	// 获取客户端的 Context
+	ctx := req.Context()
+
 	rangeHeader := req.Header.Get("Range")
 	if rangeHeader == "" {
 		rangeHeader = "bytes=0-"
@@ -146,6 +154,14 @@ func proxyAsync(url string, headers map[string]string, req *http.Request, w http
 
 	for currentStart <= finalEndPoint {
 
+		// 检查客户端是否已经关闭了播放器
+		select {
+		case <-ctx.Done():
+			log.Printf("客户端已断开连接，停止代理分片。")
+			return
+		default:
+		}
+
 		// 每轮重新创建 channel，避免复用问题
 		channels := make([]chan []byte, ThreadNum)
 		for i := range channels {
@@ -166,7 +182,7 @@ func proxyAsync(url string, headers map[string]string, req *http.Request, w http
 			go func(idx int, start, end int64) {
 				defer wg.Done()
 				defer close(channels[idx]) // ✅ goroutine 结束后关闭 channel
-				getVideoStream(start, end, contentLength, url, newHeaders, channels[idx])
+				getVideoStream(ctx, start, end, contentLength, url, newHeaders, channels[idx])
 			}(i, chunkStart, chunkEnd)
 
 			currentStart = chunkEnd + 1
@@ -263,7 +279,7 @@ func getInfo(url string, headers map[string]string) (map[string]string, error) {
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	req.Header.Set("Range", "bytes=0-1048575") // 1MB
+	req.Header.Set("Range", "bytes=0-0") // 1MB
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -302,30 +318,38 @@ func parseContentLengthFromRange(contentRange string) int64 {
 	return 0
 }
 
-func getVideoStream(start, end int64, contentLength int64, url string, headers map[string]string, ch chan []byte) {
-
+func getVideoStream(ctx context.Context, start, end int64, contentLength int64, url string, headers map[string]string, ch chan []byte) {
 	if start > contentLength {
-		close(ch)
 		return
 	}
 	log.Printf("开始获取视频片段 %d-%d", start, end)
-	req, err := http.NewRequest("GET", url, nil)
+	// 使用 NewRequestWithContext，将客户端状态与源站请求绑定
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		log.Printf("构造请求出错")
+		log.Printf("构造请求出错: %v", err)
+		return
 	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
 
-	client := &http.Client{}
+	// 设置超时时间，防止 Goroutine 永久卡死
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("请求视频出错出错")
+		log.Printf("请求视频出错: %v", err)
+		return // 修复：必须 return，防止后续 defer 空指针 Panic
 	}
 	defer resp.Body.Close()
 
 	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("读取响应体出错: %v", err)
+		return
+	}
 
 	if start == 0 {
 		offset := detectMaliciousPrefix(data)
@@ -333,7 +357,6 @@ func getVideoStream(start, end int64, contentLength int64, url string, headers m
 	} else {
 		ch <- data
 	}
-
 }
 
 func miner(a, b int64) int64 {
